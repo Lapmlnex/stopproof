@@ -11,7 +11,9 @@
 - Bound stdout/stderr retention while continuing to drain verbose test processes.
   Avoid timer overflow for very large positive timeout values.
 - Reject malformed existing Claude settings during initialization and preserve
-  the original file. Report backup and ignore-file write failures.
+  the original file, including malformed nested hook structures and dangling
+  settings symlinks. Preserve valid command, prompt, agent, HTTP, and MCP tool
+  hooks. Report backup and ignore-file write failures.
 - Build on Linux musl, macOS Intel, macOS Apple silicon, and Windows. Aggregate all
   binaries before one release job publishes assets and SHA256SUMS.
 - Verify staged installer downloads and preserve an existing executable on

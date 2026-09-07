@@ -21,3 +21,10 @@ attestation, or adequate test coverage. These limits are stated in README.md and
 SECURITY.md. Current manual CLI contracts, JSON output, detection-only doctor, and
 invalid-config handling are tested directly rather than inferred from external
 documentation.
+
+The same hooks reference was checked again for the init review fix: each event
+contains hook groups, whose `hooks` arrays contain typed handlers. Required string
+fields differ by type (`command`, `prompt`, `url`, or `server`/`tool`).
+`src/init_cmd.rs` now validates these nested structures before writes, while tests
+confirm valid prompt, agent, HTTP, and MCP tool handlers are preserved. This is a
+structural preflight, not a complete Claude Code settings-schema validator.

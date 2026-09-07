@@ -620,6 +620,111 @@ fn init_invalid_settings_reports_failure_and_preserves_original() {
     }
 }
 
+fn assert_init_preserves_invalid_settings(invalid: &str) {
+    let dir = tempdir("init-nested-invalid");
+    write_file(&dir, ".claude/settings.json", invalid);
+    let (code, stdout, stderr) = run_with_stdin(&dir, &["init"], "");
+    assert_eq!(code, Some(2), "{invalid}: {stdout}\n{stderr}");
+    assert!(!stdout.contains("installed"));
+    assert!(stderr.contains(".claude/settings.json"));
+    assert_eq!(
+        std::fs::read_to_string(dir.join(".claude/settings.json")).unwrap(),
+        invalid
+    );
+    assert!(!dir.join(".stopproof.json").exists());
+    assert!(!dir.join(".gitignore").exists());
+    assert_eq!(std::fs::read_dir(dir.join(".claude")).unwrap().count(), 1);
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn init_rejects_non_object_stop_entries() {
+    assert_init_preserves_invalid_settings(r#"{"hooks":{"Stop":[42]}}"#);
+}
+
+#[test]
+fn init_rejects_non_array_nested_hooks() {
+    assert_init_preserves_invalid_settings(r#"{"hooks":{"Stop":[{"hooks":"broken"}]}}"#);
+}
+
+#[test]
+fn init_rejects_non_string_hook_commands() {
+    assert_init_preserves_invalid_settings(
+        r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":42}]}]}}"#,
+    );
+}
+
+#[test]
+fn init_rejects_other_malformed_hook_structures() {
+    for invalid in [
+        r#"{"hooks":{"Stop":[{}]}}"#,
+        r#"{"hooks":{"Stop":[{"hooks":[false]}]}}"#,
+        r#"{"hooks":{"Stop":[{"hooks":[{"type":42}]}]}}"#,
+        r#"{"hooks":{"Stop":[{"hooks":[{"type":"command"}]}]}}"#,
+        r#"{"hooks":{"Stop":[{"hooks":[{"type":"prompt","prompt":false}]}]}}"#,
+        r#"{"hooks":{"Stop":[{"hooks":[{"type":"agent"}]}]}}"#,
+        r#"{"hooks":{"Stop":[{"hooks":[{"type":"unknown"}]}]}}"#,
+        r#"{"hooks":{"PreToolUse":[42]}}"#,
+    ] {
+        assert_init_preserves_invalid_settings(invalid);
+    }
+}
+
+#[test]
+fn init_preserves_valid_prompt_agent_and_other_hook_types() {
+    let dir = tempdir("init-hook-types");
+    let original = serde_json::json!({
+        "permissions": {"allow": ["Read"]},
+        "hooks": {
+            "Stop": [{"hooks": [
+                {"type": "prompt", "prompt": "Check completion", "model": "haiku", "timeout": 30},
+                {"type": "agent", "prompt": "Review test results", "timeout": 90},
+                {"type": "http", "url": "http://localhost:9000/stop", "headers": {"X-Example": "value"}},
+                {"type": "mcp_tool", "server": "local_checks", "tool": "verify", "input": {"value": 42}}
+            ]}],
+            "PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "other-tool"}]}]
+        }
+    });
+    write_file(&dir, ".claude/settings.json", &original.to_string());
+    let (code, stdout, stderr) = run_with_stdin(&dir, &["init"], "");
+    assert_eq!(code, Some(0), "{stdout}\n{stderr}");
+    let installed: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(dir.join(".claude/settings.json")).unwrap())
+            .unwrap();
+    assert_eq!(installed["hooks"]["Stop"][0], original["hooks"]["Stop"][0]);
+    assert_eq!(
+        installed["hooks"]["PreToolUse"],
+        original["hooks"]["PreToolUse"]
+    );
+    assert_eq!(installed["permissions"], original["permissions"]);
+    assert_eq!(installed["hooks"]["Stop"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        installed["hooks"]["Stop"][1]["hooks"][0]["command"],
+        "stopproof"
+    );
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[cfg(unix)]
+#[test]
+fn init_rejects_dangling_settings_symlink_without_creating_target() {
+    let dir = tempdir("init-settings-symlink");
+    let project = dir.join("project");
+    std::fs::create_dir_all(project.join(".claude")).unwrap();
+    let external_target = dir.join("missing-external-settings.json");
+    let settings = project.join(".claude/settings.json");
+    std::os::unix::fs::symlink(&external_target, &settings).unwrap();
+    let (code, stdout, stderr) = run_with_stdin(&project, &["init"], "");
+    assert_eq!(code, Some(2), "{stdout}\n{stderr}");
+    assert!(!stdout.contains("installed"));
+    assert!(stderr.contains(".claude/settings.json"));
+    assert_eq!(std::fs::read_link(&settings).unwrap(), external_target);
+    assert!(!external_target.exists());
+    assert!(!project.join(".stopproof.json").exists());
+    assert!(!project.join(".gitignore").exists());
+    std::fs::remove_dir_all(dir).ok();
+}
+
 #[cfg(unix)]
 #[test]
 fn timeout_override_fails_the_verdict() {

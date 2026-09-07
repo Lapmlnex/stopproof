@@ -21,6 +21,57 @@ fn settings_snippet() -> String {
         .unwrap_or_default()
 }
 
+/// Check the structures we preserve while merging. This is not a complete
+/// Claude settings schema: unrelated settings and optional hook fields remain
+/// untouched, but malformed hook containers and required payloads are errors.
+fn validate_settings(root: &Value) -> Result<(), String> {
+    if !root.is_object() {
+        return Err("expected a settings object".into());
+    }
+    let Some(hooks) = root.get("hooks") else {
+        return Ok(());
+    };
+    let hooks = hooks.as_object().ok_or("hooks must be an object")?;
+    for (event, entries) in hooks {
+        let entries = entries
+            .as_array()
+            .ok_or_else(|| format!("hooks.{} must be an array", event))?;
+        for (entry_index, entry) in entries.iter().enumerate() {
+            let entry_path = format!("hooks.{}[{}]", event, entry_index);
+            if !entry.is_object() {
+                return Err(format!("{} must be an object", entry_path));
+            }
+            let handlers = entry
+                .get("hooks")
+                .and_then(Value::as_array)
+                .ok_or_else(|| format!("{}.hooks must be an array", entry_path))?;
+            for (handler_index, handler) in handlers.iter().enumerate() {
+                let handler_path = format!("{}.hooks[{}]", entry_path, handler_index);
+                if !handler.is_object() {
+                    return Err(format!("{} must be an object", handler_path));
+                }
+                let kind = handler
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| format!("{}.type must be a string", handler_path))?;
+                let required: &[&str] = match kind {
+                    "command" => &["command"],
+                    "prompt" | "agent" => &["prompt"],
+                    "http" => &["url"],
+                    "mcp_tool" => &["server", "tool"],
+                    _ => return Err(format!("{}.type is unsupported: {}", handler_path, kind)),
+                };
+                for field in required {
+                    if handler.get(*field).and_then(Value::as_str).is_none() {
+                        return Err(format!("{}.{} must be a string", handler_path, field));
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Merge our Stop hook into an existing settings JSON value.
 /// Returns true if the value was modified.
 fn merge_into_settings(root: &mut Value) -> bool {
@@ -118,7 +169,12 @@ pub fn run(args: &[String]) -> i32 {
     let settings_path = claude_dir.join("settings.json");
     let existing = match std::fs::read_to_string(&settings_path) {
         Ok(text) => Some(text),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+        Err(err)
+            if err.kind() == std::io::ErrorKind::NotFound
+                && matches!(std::fs::symlink_metadata(&settings_path), Err(missing) if missing.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            None
+        }
         Err(err) => {
             return crate::cli_error(
                 false,
@@ -136,14 +192,11 @@ pub fn run(args: &[String]) -> i32 {
         }
         None => json!({}),
     };
-    let valid_shape = root.is_object()
-        && root.get("hooks").map_or(true, Value::is_object)
-        && root
-            .get("hooks")
-            .and_then(|hooks| hooks.get("Stop"))
-            .map_or(true, Value::is_array);
-    if !valid_shape {
-        return crate::cli_error(false, "invalid .claude/settings.json: expected an object, hooks object, and Stop array; file preserved");
+    if let Err(err) = validate_settings(&root) {
+        return crate::cli_error(
+            false,
+            &format!("invalid .claude/settings.json: {}; file preserved", err),
+        );
     }
 
     // 1. Default config (never overwrite an existing one).
