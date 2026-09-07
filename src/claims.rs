@@ -79,11 +79,11 @@ pub fn extract(final_text: &str, extra_keywords: &[String]) -> Claims {
     let mut claims = Claims::default();
     let lower = final_text.to_lowercase();
 
-    for kw in BASE_KEYWORDS.iter().map(|s| s.to_string()).chain(
-        extra_keywords
-            .iter()
-            .map(|s| s.to_lowercase()),
-    ) {
+    for kw in BASE_KEYWORDS
+        .iter()
+        .map(|s| s.to_string())
+        .chain(extra_keywords.iter().map(|s| s.to_lowercase()))
+    {
         if kw.is_empty() {
             continue;
         }
@@ -103,8 +103,20 @@ pub fn extract(final_text: &str, extra_keywords: &[String]) -> Claims {
             .trim_matches(|c: char| {
                 matches!(
                     c,
-                    '`' | '(' | ')' | '"' | '\'' | '*' | ',' | ';' | ':' | '[' | ']' | '<' | '>'
-                        | '!' | '?'
+                    '`' | '('
+                        | ')'
+                        | '"'
+                        | '\''
+                        | '*'
+                        | ','
+                        | ';'
+                        | ':'
+                        | '['
+                        | ']'
+                        | '<'
+                        | '>'
+                        | '!'
+                        | '?'
                 )
             })
             .trim_end_matches('.');

@@ -268,10 +268,7 @@ fn off_mode_is_a_noop() {
     write_file(&dir, "app.py", "print('hi')\n");
     let t = write_transcript(
         &dir,
-        &[
-            edit_tool_line("app.py"),
-            assistant_text_line("Done."),
-        ],
+        &[edit_tool_line("app.py"), assistant_text_line("Done.")],
     );
     let (code, stdout) = run_hook(&dir, &hook_stdin("s-off", &t, &dir));
     assert_eq!(code, Some(0));
@@ -329,7 +326,11 @@ fn init_preserves_existing_settings() {
     assert_eq!(code, Some(0));
     let settings = std::fs::read_to_string(dir.join(".claude/settings.json")).unwrap();
     assert!(settings.contains("dcg"), "existing hook lost: {}", settings);
-    assert!(settings.contains("Bash(ls:*)"), "permissions lost: {}", settings);
+    assert!(
+        settings.contains("Bash(ls:*)"),
+        "permissions lost: {}",
+        settings
+    );
     assert!(settings.contains("stopproof"));
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -348,10 +349,7 @@ fn skip_env_var_bypasses_everything() {
     write_file(&dir, "app.py", "print('hi')\n");
     let t = write_transcript(
         &dir,
-        &[
-            edit_tool_line("app.py"),
-            assistant_text_line("Done."),
-        ],
+        &[edit_tool_line("app.py"), assistant_text_line("Done.")],
     );
     let mut child = Command::new(bin())
         .current_dir(&dir)
@@ -369,5 +367,318 @@ fn skip_env_var_bypasses_everything() {
     let out = child.wait_with_output().unwrap();
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn run_json_is_one_receipt_and_honors_command_override() {
+    let dir = tempdir("json-override");
+    write_file(&dir, ".stopproof.json", r#"{"test_command":"exit 9"}"#);
+    let (code, stdout, stderr) = run_with_stdin(
+        &dir,
+        &[
+            "run",
+            "--command",
+            "echo RUN_OUTPUT",
+            "--timeout",
+            "5",
+            "--strict",
+            "--json",
+        ],
+        "",
+    );
+    assert_eq!(code, Some(0), "{stdout}\n{stderr}");
+    let receipt: serde_json::Value = serde_json::from_str(&stdout).expect("stdout is only JSON");
+    assert_eq!(receipt["verdict"], "pass");
+    assert_eq!(receipt["test_command"], "echo RUN_OUTPUT");
+    assert_eq!(receipt["test_exit"], 0);
+    assert!(receipt["checks"].as_array().unwrap().iter().any(|c| {
+        c["name"] == "tests" && c["detail"].as_str().unwrap().contains("from --command")
+    }));
+    assert!(receipt["test_output_tail"]
+        .as_str()
+        .unwrap()
+        .contains("RUN_OUTPUT"));
+    assert!(dir.join(".stopproof/last-receipt.md").is_file());
+    assert!(stderr.trim().is_empty(), "{stderr}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn run_json_failure_has_verdict_exit_one() {
+    let dir = tempdir("json-failure");
+    let (code, stdout, _) = run_with_stdin(&dir, &["run", "--command", "exit 7", "--json"], "");
+    assert_eq!(code, Some(1));
+    let receipt: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(receipt["verdict"], "fail");
+    assert_eq!(receipt["test_exit"], 7);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn strict_empty_project_fails_with_a_receipt() {
+    let dir = tempdir("strict-empty");
+    let (code, stdout, _) = run_with_stdin(&dir, &["run", "--strict", "--json"], "");
+    assert_eq!(code, Some(1));
+    let receipt: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(receipt["verdict"], "fail");
+    assert!(receipt["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|c| c["name"] == "tests" && c["status"] == "fail"));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn manual_and_doctor_reject_invalid_config_before_execution() {
+    let dir = tempdir("badconfig");
+    for config in [
+        "{broken",
+        r#"{"mode":"enforc"}"#,
+        r#"{"verify_when":"sometimes"}"#,
+        r#"{"test_timeout_secs":0}"#,
+        r#"{"test_comand":"exit 0"}"#,
+        r#"{"receipt_dir":" "}"#,
+    ] {
+        write_file(&dir, ".stopproof.json", config);
+        for args in [
+            vec!["run", "--command", "echo bad > executed", "--json"],
+            vec!["doctor", "--json"],
+        ] {
+            let (code, stdout, stderr) = run_with_stdin(&dir, &args, "");
+            assert_eq!(code, Some(2), "{config}: {stdout}\n{stderr}");
+            let error: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+            assert!(error["error"].as_str().unwrap().contains(".stopproof.json"));
+        }
+        assert!(!dir.join("executed").exists());
+        assert!(!dir.join(".stopproof").exists());
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn unreadable_config_is_not_treated_as_missing() {
+    let dir = tempdir("config-directory");
+    std::fs::create_dir(dir.join(".stopproof.json")).unwrap();
+    let (code, _, stderr) = run_with_stdin(&dir, &["run"], "");
+    assert_eq!(code, Some(2));
+    assert!(stderr.contains(".stopproof.json"));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[cfg(unix)]
+#[test]
+fn dangling_config_symlink_is_an_error() {
+    let dir = tempdir("config-symlink");
+    std::os::unix::fs::symlink("missing-config.json", dir.join(".stopproof.json")).unwrap();
+    let (code, stdout, _) = run_with_stdin(&dir, &["doctor", "--json"], "");
+    assert_eq!(code, Some(2), "{stdout}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn unknown_arguments_and_invalid_option_values_are_usage_errors() {
+    let dir = tempdir("badargs");
+    for args in [
+        vec!["unknown"],
+        vec!["run", "--typo"],
+        vec!["run", "unexpected"],
+        vec!["run", "--command"],
+        vec!["run", "--command", " "],
+        vec!["run", "--timeout"],
+        vec!["run", "--timeout", "0"],
+        vec!["run", "--timeout", "-1"],
+        vec!["run", "--timeout", "1.5"],
+        vec!["run", "--timeout", "nope"],
+        vec!["doctor", "--strict"],
+        vec!["init", "--unknown"],
+        vec!["hook", "--unknown"],
+        vec!["--version", "--unknown"],
+    ] {
+        let (code, stdout, stderr) = run_with_stdin(&dir, &args, "");
+        assert_eq!(code, Some(2), "{args:?}: {stdout}\n{stderr}");
+        assert!(stdout.is_empty(), "error prose belongs on stderr: {stdout}");
+        assert!(!stderr.is_empty());
+    }
+    let (code, stdout, _) = run_with_stdin(&dir, &["run", "--typo", "--json"], "");
+    assert_eq!(code, Some(2));
+    assert!(serde_json::from_str::<serde_json::Value>(&stdout).unwrap()["error"].is_string());
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn doctor_reports_config_without_running_the_command() {
+    let dir = tempdir("doctor");
+    write_file(
+        &dir,
+        ".stopproof.json",
+        r#"{"test_command":"echo ran > executed","test_timeout_secs":42}"#,
+    );
+    let (code, stdout, stderr) = run_with_stdin(&dir, &["doctor", "--json"], "");
+    assert_eq!(code, Some(0), "{stderr}");
+    let report: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(report["config"]["test_timeout_secs"], 42);
+    assert_eq!(report["config_source"], ".stopproof.json");
+    assert_eq!(report["test_command"], "echo ran > executed");
+    assert_eq!(report["detected_from"], "config");
+    assert_eq!(report["command_executed"], false);
+    assert!(!dir.join("executed").exists());
+    assert!(!dir.join(".stopproof").exists());
+    let (code, human, _) = run_with_stdin(&dir, &["doctor"], "");
+    assert_eq!(code, Some(0));
+    assert!(human.contains("echo ran > executed"));
+    assert!(human.contains("42"));
+    assert!(human.contains("not executed"));
+    assert!(!dir.join("executed").exists());
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn doctor_warns_when_no_tests_are_detected() {
+    let dir = tempdir("doctor-empty");
+    let (code, stdout, _) = run_with_stdin(&dir, &["doctor", "--json"], "");
+    assert_eq!(code, Some(0));
+    let report: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert!(report["test_command"].is_null());
+    assert_eq!(report["config_source"], "defaults");
+    assert!(!report["warnings"].as_array().unwrap().is_empty());
+    let (_, human, _) = run_with_stdin(&dir, &["doctor"], "");
+    assert!(human.contains("WARN") && human.contains("no test command"));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn failed_receipt_storage_makes_manual_verification_fail() {
+    let dir = tempdir("receipt-failure");
+    write_file(&dir, ".stopproof", "this path is a file");
+    let (code, stdout, _) = run_with_stdin(&dir, &["run", "--command", "exit 0", "--json"], "");
+    assert_eq!(code, Some(1));
+    let receipt: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(receipt["verdict"], "fail");
+    assert!(receipt["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|c| c["name"] == "receipt-storage" && c["status"] == "fail"));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn failed_receipt_storage_hook_allows_without_claiming_verified() {
+    let dir = tempdir("hook-receipt-failure");
+    write_file(&dir, ".stopproof", "this path is a file");
+    write_file(
+        &dir,
+        ".stopproof.json",
+        r#"{"test_command":"exit 0","verify_when":"always"}"#,
+    );
+    let t = write_transcript(&dir, &[assistant_text_line("Done.")]);
+    let (code, stdout) = run_hook(&dir, &hook_stdin("s-storage", &t, &dir));
+    assert_eq!(code, Some(0));
+    assert!(!stdout.contains("\"decision\""));
+    assert!(
+        stdout.contains("receipt") && stdout.contains("not saved"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("verified"), "{stdout}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn invalid_config_hook_still_fails_open() {
+    let dir = tempdir("hook-badconfig");
+    write_file(&dir, ".stopproof.json", "{invalid");
+    let t = write_transcript(
+        &dir,
+        &[edit_tool_line("app.py"), assistant_text_line("Done.")],
+    );
+    let (code, stdout) = run_hook(&dir, &hook_stdin("s-bad-config", &t, &dir));
+    assert_eq!(code, Some(0));
+    assert!(!stdout.contains("\"decision\""));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn init_invalid_settings_reports_failure_and_preserves_original() {
+    for invalid in [
+        "{broken",
+        "[]",
+        r#"{"hooks":42}"#,
+        r#"{"hooks":{"Stop":{}}}"#,
+    ] {
+        let dir = tempdir("init-invalid");
+        write_file(&dir, ".claude/settings.json", invalid);
+        let (code, stdout, stderr) = run_with_stdin(&dir, &["init"], "");
+        assert_eq!(code, Some(2), "{stdout}\n{stderr}");
+        assert!(!stdout.contains("installed"));
+        assert_eq!(
+            std::fs::read_to_string(dir.join(".claude/settings.json")).unwrap(),
+            invalid
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn timeout_override_fails_the_verdict() {
+    let dir = tempdir("timeout-override");
+    let (code, stdout, _) = run_with_stdin(
+        &dir,
+        &[
+            "run",
+            "--command",
+            "exec sleep 3",
+            "--timeout",
+            "1",
+            "--json",
+        ],
+        "",
+    );
+    assert_eq!(code, Some(1));
+    let receipt: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert!(receipt["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|c| c["detail"].as_str().unwrap().contains("timed out after 1s")));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn largest_timeout_does_not_overflow_the_clock() {
+    let dir = tempdir("timeout-max");
+    let (code, stdout, stderr) = run_with_stdin(
+        &dir,
+        &[
+            "run",
+            "--command",
+            "exit 0",
+            "--timeout",
+            "18446744073709551615",
+            "--json",
+        ],
+        "",
+    );
+    assert_eq!(code, Some(0), "{stdout}\n{stderr}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[cfg(unix)]
+#[test]
+fn large_subprocess_output_is_drained_and_a_small_tail_is_reported() {
+    let dir = tempdir("large-output");
+    let command = "i=0; while [ \"$i\" -lt 25000 ]; do echo 1234567890123456789012345678901234567890; echo 1234567890123456789012345678901234567890 >&2; i=$((i+1)); done; echo FINAL_OUTPUT >&2";
+    let (code, stdout, stderr) = run_with_stdin(
+        &dir,
+        &["run", "--command", command, "--timeout", "30", "--json"],
+        "",
+    );
+    assert_eq!(code, Some(0), "{stderr}");
+    let receipt: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let tail = receipt["test_output_tail"].as_str().unwrap();
+    assert!(tail.len() <= 3503);
+    assert!(tail.contains("FINAL_OUTPUT"));
     std::fs::remove_dir_all(&dir).ok();
 }

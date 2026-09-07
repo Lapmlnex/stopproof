@@ -1,0 +1,7 @@
+{
+  "mode": "warn",
+  "test_command": "",
+  "verify_when": "always",
+  "require_tests": true,
+  "max_attempts": 2
+}

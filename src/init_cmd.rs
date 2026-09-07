@@ -28,9 +28,7 @@ fn merge_into_settings(root: &mut Value) -> bool {
         *root = json!({});
     }
     let obj = root.as_object_mut().expect("checked above");
-    let hooks = obj
-        .entry("hooks".to_string())
-        .or_insert_with(|| json!({}));
+    let hooks = obj.entry("hooks".to_string()).or_insert_with(|| json!({}));
     if !hooks.is_object() {
         *hooks = json!({});
     }
@@ -65,12 +63,16 @@ fn merge_into_settings(root: &mut Value) -> bool {
     true
 }
 
-fn ensure_gitignore(cwd: &Path, receipt_dir: &str) {
+fn ensure_gitignore(cwd: &Path, receipt_dir: &str) -> std::io::Result<()> {
     let path = cwd.join(".gitignore");
     let line = format!("{}/", receipt_dir.trim_end_matches('/'));
-    let current = std::fs::read_to_string(&path).unwrap_or_default();
+    let current = match std::fs::read_to_string(&path) {
+        Ok(current) => current,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(err) => return Err(err),
+    };
     if current.lines().any(|l| l.trim() == line) {
-        return;
+        return Ok(());
     }
     let mut next = current;
     if !next.is_empty() && !next.ends_with('\n') {
@@ -78,11 +80,14 @@ fn ensure_gitignore(cwd: &Path, receipt_dir: &str) {
     }
     next.push_str(&line);
     next.push('\n');
-    std::fs::write(&path, next).ok();
+    std::fs::write(&path, next)
 }
 
 pub fn run(args: &[String]) -> i32 {
-    let print_only = args.iter().any(|a| a == "--print");
+    let print_only = args.len() == 1 && args[0] == "--print";
+    if !args.is_empty() && !print_only {
+        return crate::cli_error(false, "init accepts only --print");
+    }
     let cwd = match std::env::current_dir() {
         Ok(d) => d,
         Err(e) => {
@@ -96,8 +101,49 @@ pub fn run(args: &[String]) -> i32 {
 
     if print_only {
         println!("# {} (project root)\n{}\n", CONFIG_FILE, default_cfg);
-        println!("# .claude/settings.json (merge into \"hooks\")\n{}", settings_snippet());
+        println!(
+            "# .claude/settings.json (merge into \"hooks\")\n{}",
+            settings_snippet()
+        );
         return 0;
+    }
+
+    // Validate existing input before making any changes. An unreadable file
+    // must never be treated as a missing file and overwritten.
+    let cfg = match crate::config::load(&cwd) {
+        Ok(cfg) => cfg,
+        Err(err) => return crate::cli_error(false, &err),
+    };
+    let claude_dir = cwd.join(".claude");
+    let settings_path = claude_dir.join("settings.json");
+    let existing = match std::fs::read_to_string(&settings_path) {
+        Ok(text) => Some(text),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+        Err(err) => {
+            return crate::cli_error(
+                false,
+                &format!("cannot read .claude/settings.json: {}", err),
+            )
+        }
+    };
+    let mut root = match existing.as_deref().map(serde_json::from_str::<Value>) {
+        Some(Ok(value)) => value,
+        Some(Err(err)) => {
+            return crate::cli_error(
+                false,
+                &format!("invalid .claude/settings.json: {}; file preserved", err),
+            )
+        }
+        None => json!({}),
+    };
+    let valid_shape = root.is_object()
+        && root.get("hooks").map_or(true, Value::is_object)
+        && root
+            .get("hooks")
+            .and_then(|hooks| hooks.get("Stop"))
+            .map_or(true, Value::is_array);
+    if !valid_shape {
+        return crate::cli_error(false, "invalid .claude/settings.json: expected an object, hooks object, and Stop array; file preserved");
     }
 
     // 1. Default config (never overwrite an existing one).
@@ -112,52 +158,45 @@ pub fn run(args: &[String]) -> i32 {
     }
 
     // 2. Hook registration in .claude/settings.json.
-    let claude_dir = cwd.join(".claude");
     if std::fs::create_dir_all(&claude_dir).is_err() {
         eprintln!("stopproof: failed to create .claude/");
         return 1;
     }
-    let settings_path = claude_dir.join("settings.json");
-    let existing = std::fs::read_to_string(&settings_path).ok();
-    let parsed: Option<Result<Value, serde_json::Error>> =
-        existing.as_deref().map(serde_json::from_str);
-
-    if matches!(parsed, Some(Err(_))) {
-        // The file existed but didn't parse — refuse to clobber it.
-        eprintln!(
-            "stopproof: .claude/settings.json exists but is not valid JSON; not touching it.\nAdd this manually:\n{}",
-            settings_snippet()
-        );
-    } else {
-        let mut root: Value = match parsed {
-            Some(Ok(v)) => v,
-            _ => json!({}),
-        };
-        let modified = merge_into_settings(&mut root);
-        if modified {
-            if let Some(orig) = &existing {
-                let backup = claude_dir.join(format!(
-                    "settings.json.bak.{}",
-                    crate::timefmt::compact_ts(crate::timefmt::now_epoch_secs())
-                ));
-                std::fs::write(backup, orig).ok();
-            }
-            let pretty = serde_json::to_string_pretty(&root).unwrap_or_default();
-            if std::fs::write(&settings_path, format!("{}\n", pretty)).is_ok() {
-                println!("  + registered Stop hook in .claude/settings.json");
-            } else {
-                eprintln!("stopproof: failed to write .claude/settings.json");
+    let modified = merge_into_settings(&mut root);
+    if modified {
+        if let Some(orig) = &existing {
+            let backup = claude_dir.join(format!(
+                "settings.json.bak.{}",
+                crate::timefmt::compact_ts(crate::timefmt::now_epoch_secs())
+            ));
+            if let Err(err) = std::fs::write(backup, orig) {
+                eprintln!(
+                    "stopproof: cannot back up settings: {}; original preserved",
+                    err
+                );
                 return 1;
             }
-        } else {
-            println!("  = Stop hook already registered in .claude/settings.json");
         }
+        let pretty = serde_json::to_string_pretty(&root).unwrap_or_default();
+        if std::fs::write(&settings_path, format!("{}\n", pretty)).is_ok() {
+            println!("  + registered Stop hook in .claude/settings.json");
+        } else {
+            eprintln!("stopproof: failed to write .claude/settings.json");
+            return 1;
+        }
+    } else {
+        println!("  = Stop hook already registered in .claude/settings.json");
     }
 
     // 3. Keep receipts out of version control by default.
-    let cfg = crate::config::load(&cwd);
-    ensure_gitignore(&cwd, &cfg.receipt_dir);
-    println!("  + ensured {}/ is gitignored", cfg.receipt_dir.trim_end_matches('/'));
+    if let Err(err) = ensure_gitignore(&cwd, &cfg.receipt_dir) {
+        eprintln!("stopproof: failed to update .gitignore: {}", err);
+        return 1;
+    }
+    println!(
+        "  + ensured {}/ is gitignored",
+        cfg.receipt_dir.trim_end_matches('/')
+    );
 
     println!(
         "\nstopproof is installed for this project.\n

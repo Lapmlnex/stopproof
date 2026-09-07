@@ -62,7 +62,14 @@ fn parse_porcelain(out: &str, ignore: &[String]) -> (Vec<String>, Vec<String>) {
 }
 
 const ASSERT_MARKERS: [&str; 8] = [
-    "assert", "expect(", "#[test]", "def test_", "it(", ".test(", "test(", "should",
+    "assert",
+    "expect(",
+    "#[test]",
+    "def test_",
+    "it(",
+    ".test(",
+    "test(",
+    "should",
 ];
 
 fn count_assertion_lines(diff: &str) -> (i64, i64) {

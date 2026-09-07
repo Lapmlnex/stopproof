@@ -6,7 +6,7 @@ use std::path::Path;
 pub const CONFIG_FILE: &str = ".stopproof.json";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct Config {
     /// "enforce" (block stop on failure) | "warn" (report, never block) | "off"
     pub mode: String,
@@ -46,19 +46,42 @@ impl Default for Config {
     }
 }
 
-/// Load config from `<cwd>/.stopproof.json`. Missing file or parse errors
-/// fall back to defaults (a broken config must never brick a session).
-pub fn load(cwd: &Path) -> Config {
+/// Missing configuration uses defaults. Existing invalid or unreadable files
+/// are errors; the caller chooses whether to fail open (hook) or fail (CLI).
+pub fn load(cwd: &Path) -> Result<Config, String> {
     let path = cwd.join(CONFIG_FILE);
-    match std::fs::read_to_string(path) {
-        Ok(text) => match serde_json::from_str::<Config>(&text) {
-            Ok(cfg) => cfg,
-            Err(err) => {
-                eprintln!("stopproof: ignoring invalid {}: {}", CONFIG_FILE, err);
-                Config::default()
-            }
-        },
-        Err(_) => Config::default(),
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(err)
+            if err.kind() == std::io::ErrorKind::NotFound
+                && matches!(std::fs::symlink_metadata(&path), Err(missing) if missing.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            return Ok(Config::default());
+        }
+        Err(err) => return Err(format!("cannot read {}: {}", path.display(), err)),
+    };
+    let cfg: Config = serde_json::from_str(&text)
+        .map_err(|err| format!("invalid {}: {}", path.display(), err))?;
+    cfg.validate()
+        .map_err(|err| format!("invalid {}: {}", path.display(), err))?;
+    Ok(cfg)
+}
+
+impl Config {
+    fn validate(&self) -> Result<(), String> {
+        if !matches!(self.mode.as_str(), "enforce" | "warn" | "off") {
+            return Err("mode must be enforce, warn, or off".into());
+        }
+        if !matches!(self.verify_when.as_str(), "auto" | "always") {
+            return Err("verify_when must be auto or always".into());
+        }
+        if self.test_timeout_secs == 0 {
+            return Err("test_timeout_secs must be a positive integer".into());
+        }
+        if self.receipt_dir.trim().is_empty() {
+            return Err("receipt_dir must not be empty".into());
+        }
+        Ok(())
     }
 }
 
@@ -84,7 +107,7 @@ mod tests {
 
     #[test]
     fn missing_file_yields_defaults() {
-        let c = load(Path::new("/definitely/not/a/real/dir"));
+        let c = load(Path::new("/definitely/not/a/real/dir")).unwrap();
         assert_eq!(c.mode, "enforce");
     }
 }

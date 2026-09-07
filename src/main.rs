@@ -7,6 +7,7 @@
 
 mod claims;
 mod config;
+mod doctor;
 mod gitstate;
 mod hook_io;
 mod init_cmd;
@@ -28,7 +29,9 @@ fn print_usage() {
 USAGE:
   stopproof            Run as a Claude Code Stop hook (reads JSON on stdin)
   stopproof hook       Same as above, explicit
-  stopproof run        Verify the current directory manually (great for CI)
+  stopproof run [--command <shell command>] [--timeout <seconds>] [--strict] [--json]
+                      Verify the current directory; exit 0 pass, 1 fail, 2 error
+  stopproof doctor [--json]  Inspect configuration and detection without running tests
   stopproof init       Install the hook + default config into this project
   stopproof init --print   Print config snippets without writing files
   stopproof --version  Print version
@@ -41,24 +44,100 @@ DOCS: https://github.com/Lapmlnex/stopproof",
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let code = match args.first().map(|s| s.as_str()) {
-        None | Some("hook") => hook_main(),
-        Some("run") => run_main(),
+        None => hook_main(),
+        Some("hook") if args.len() == 1 => hook_main(),
+        Some("run") if args.get(1).map(String::as_str) == Some("--help") && args.len() == 2 => {
+            print_usage();
+            0
+        }
+        Some("run") => run_main(&args[1..]),
+        Some("doctor") => doctor_main(&args[1..]),
         Some("init") => init_cmd::run(&args[1..]),
-        Some("--version") | Some("-V") | Some("version") => {
+        Some("--version" | "-V" | "version") if args.len() == 1 => {
             println!("stopproof {}", VERSION);
             0
         }
-        Some("--help") | Some("-h") | Some("help") => {
+        Some("--help" | "-h" | "help") if args.len() == 1 => {
             print_usage();
             0
         }
-        Some(other) => {
-            eprintln!("stopproof: unknown command `{}`\n", other);
-            print_usage();
-            1
-        }
+        Some(other) => cli_error(
+            args.iter().any(|a| a == "--json"),
+            &format!(
+                "unknown command or arguments for `{}`; try stopproof --help",
+                other
+            ),
+        ),
     };
     std::process::exit(code);
+}
+
+fn cli_error(json: bool, message: &str) -> i32 {
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({"tool": "stopproof", "version": VERSION, "error": message})
+        );
+    } else {
+        eprintln!("stopproof: {}", message);
+    }
+    2
+}
+
+#[derive(Default)]
+struct RunOptions {
+    command: Option<String>,
+    timeout: Option<u64>,
+    strict: bool,
+    json: bool,
+}
+
+impl RunOptions {
+    fn parse(args: &[String]) -> Result<Self, String> {
+        let mut options = Self::default();
+        let mut args = args.iter();
+        while let Some(arg) = args.next() {
+            match arg.as_str() {
+                "--json" if !options.json => options.json = true,
+                "--strict" if !options.strict => options.strict = true,
+                "--command" if options.command.is_none() => {
+                    let command = args.next().ok_or("--command requires a shell command")?;
+                    if command.trim().is_empty() || command.starts_with("--") {
+                        return Err("--command requires a nonempty shell command".into());
+                    }
+                    options.command = Some(command.clone());
+                }
+                "--timeout" if options.timeout.is_none() => {
+                    let timeout = args
+                        .next()
+                        .and_then(|v| v.parse::<u64>().ok())
+                        .filter(|v| *v > 0)
+                        .ok_or("--timeout requires a positive integer number of seconds")?;
+                    options.timeout = Some(timeout);
+                }
+                _ => return Err(format!("unknown or repeated option `{}`", arg)),
+            }
+        }
+        Ok(options)
+    }
+}
+
+fn doctor_main(args: &[String]) -> i32 {
+    let json = args.iter().any(|a| a == "--json");
+    if !(args.is_empty() || args.len() == 1 && json) {
+        return cli_error(json, "doctor accepts only --json");
+    }
+    let cwd = match std::env::current_dir() {
+        Ok(cwd) => cwd,
+        Err(err) => return cli_error(json, &format!("cannot resolve current directory: {}", err)),
+    };
+    match doctor::inspect(&cwd) {
+        Ok(report) => {
+            doctor::print(&report, json);
+            0
+        }
+        Err(err) => cli_error(json, &err),
+    }
 }
 
 struct Verification {
@@ -68,12 +147,12 @@ struct Verification {
 }
 
 fn build_verification(
-    cwd: &Path,
     cfg: &Config,
     facts: &transcript::TranscriptFacts,
     git: &gitstate::GitFacts,
     cl: &claims::Claims,
     has_transcript: bool,
+    test: testrun::TestOutcome,
 ) -> Verification {
     let mut checks: Vec<Check> = Vec::new();
 
@@ -140,7 +219,6 @@ fn build_verification(
     }
 
     // Check 2: tests actually pass.
-    let test = testrun::detect_and_run(cwd, cfg);
     match &test.command {
         Some(cmd) => {
             if test.timed_out {
@@ -293,7 +371,16 @@ fn hook_main() -> i32 {
     } else {
         PathBuf::from(&input.cwd)
     };
-    let cfg = config::load(&cwd);
+    let cfg = match config::load(&cwd) {
+        Ok(cfg) => cfg,
+        Err(err) => {
+            hook_io::emit_allow(Some(&format!(
+                "stopproof: configuration error; verification skipped (failing open): {}",
+                err
+            )));
+            return 0;
+        }
+    };
     if cfg.mode == "off" {
         return 0;
     }
@@ -315,7 +402,8 @@ fn hook_main() -> i32 {
         return 0;
     }
 
-    let v = build_verification(&cwd, &cfg, &facts, &git, &cl, true);
+    let test = testrun::detect_and_run(&cwd, &cfg);
+    let v = build_verification(&cfg, &facts, &git, &cl, true, test);
 
     let mut prev_blocks = hook_io::attempts_get(&cwd, &cfg.receipt_dir, &input.session_id);
     // Claude Code says a stop hook already blocked this cycle but our
@@ -326,7 +414,13 @@ fn hook_main() -> i32 {
     }
     let attempt = prev_blocks + 1;
     let rec = make_receipt(&input.session_id, attempt, &v, &facts, &git, &cl);
-    receipt::write(&cwd, &cfg, &rec);
+    if let Err(err) = receipt::write(&cwd, &cfg, &rec) {
+        hook_io::emit_allow(Some(&format!(
+            "stopproof: checks {}; receipt not saved: {}. Failing open (not blocking).",
+            v.verdict, err
+        )));
+        return 0;
+    }
 
     if v.verdict == "pass" {
         hook_io::attempts_reset(&cwd, &cfg.receipt_dir, &input.session_id);
@@ -385,31 +479,72 @@ fn hook_main() -> i32 {
     0
 }
 
-fn run_main() -> i32 {
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let cfg = config::load(&cwd);
+fn run_main(args: &[String]) -> i32 {
+    let json = args.iter().any(|a| a == "--json");
+    let options = match RunOptions::parse(args) {
+        Ok(options) => options,
+        Err(err) => return cli_error(json, &err),
+    };
+    let cwd = match std::env::current_dir() {
+        Ok(cwd) => cwd,
+        Err(err) => return cli_error(json, &format!("cannot resolve current directory: {}", err)),
+    };
+    let mut cfg = match config::load(&cwd) {
+        Ok(cfg) => cfg,
+        Err(err) => return cli_error(json, &err),
+    };
+    let command_from_cli = options.command.is_some();
+    if let Some(command) = options.command {
+        cfg.test_command = command;
+    }
+    if let Some(timeout) = options.timeout {
+        cfg.test_timeout_secs = timeout;
+    }
+    cfg.require_tests |= options.strict;
     let facts = transcript::TranscriptFacts::default();
     let git = gitstate::collect(&cwd, None, &cfg.ignore_paths);
     let cl = claims::Claims::default();
-    let v = build_verification(&cwd, &cfg, &facts, &git, &cl, false);
-    let rec = make_receipt("manual", 1, &v, &facts, &git, &cl);
-    let receipt_path = receipt::write(&cwd, &cfg, &rec);
+    let mut test = testrun::detect_and_run(&cwd, &cfg);
+    if command_from_cli {
+        test.detected_from = "--command".into();
+    }
+    let v = build_verification(&cfg, &facts, &git, &cl, false, test);
+    let mut rec = make_receipt("manual", 1, &v, &facts, &git, &cl);
+    let receipt_path = match receipt::write(&cwd, &cfg, &rec) {
+        Ok(path) => Some(path),
+        Err(err) => {
+            rec.verdict = "fail".into();
+            rec.checks.push(Check::new(
+                "receipt-storage",
+                "fail",
+                format!("receipt not saved: {}", err),
+            ));
+            None
+        }
+    };
 
-    println!("stopproof {} — manual verification\n", VERSION);
-    for c in &v.checks {
-        let icon = match c.status.as_str() {
-            "pass" => "PASS",
-            "fail" => "FAIL",
-            "warn" => "WARN",
-            _ => "INFO",
-        };
-        println!("  [{}] {}: {}", icon, c.name, c.detail);
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string(&rec).expect("receipt contains only JSON values")
+        );
+    } else {
+        println!("stopproof {} — manual verification\n", VERSION);
+        for c in &rec.checks {
+            let icon = match c.status.as_str() {
+                "pass" => "PASS",
+                "fail" => "FAIL",
+                "warn" => "WARN",
+                _ => "INFO",
+            };
+            println!("  [{}] {}: {}", icon, c.name, c.detail);
+        }
+        if let Some(p) = receipt_path {
+            println!("\nreceipt: {}", p.display());
+        }
+        println!("\nverdict: {}", rec.verdict.to_uppercase());
     }
-    if let Some(p) = receipt_path {
-        println!("\nreceipt: {}", p.display());
-    }
-    println!("\nverdict: {}", v.verdict.to_uppercase());
-    if v.verdict == "pass" {
+    if rec.verdict == "pass" {
         0
     } else {
         1

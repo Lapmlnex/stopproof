@@ -2,10 +2,10 @@ name: Release
 
 on:
   push:
-    tags: ["v*"]
+    tags: ['v*']
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -19,35 +19,84 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
-            ext: ""
-          - os: macos-13
+            ext: ''
+          - os: macos-15-intel
             target: x86_64-apple-darwin
-            ext: ""
-          - os: macos-latest
+            ext: ''
+          - os: macos-15
             target: aarch64-apple-darwin
-            ext: ""
+            ext: ''
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            ext: ".exe"
+            ext: '.exe'
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Check release version
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 | python -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')
+          test "$RELEASE_TAG" = "v$version"
       - name: Install musl tools
         if: matrix.target == 'x86_64-unknown-linux-musl'
         run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Check clippy
+        run: cargo clippy --locked --all-targets --target ${{ matrix.target }} -- -D warnings
+      - name: Test
+        run: cargo test --locked --all-targets --target ${{ matrix.target }}
+      - name: Installer regression tests
+        if: runner.os != 'Windows'
+        run: python3 -m unittest discover -s tests -p test_installer.py -v
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --locked --release --target ${{ matrix.target }}
       - name: Package
         shell: bash
         run: |
           mkdir -p dist
           cp "target/${{ matrix.target }}/release/stopproof${{ matrix.ext }}" \
              "dist/stopproof-${{ matrix.target }}${{ matrix.ext }}"
-      - name: Upload to release
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: stopproof-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    name: publish complete release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: stopproof-*
+          path: dist
+          merge-multiple: true
+      - name: Verify asset set and generate checksums
+        working-directory: dist
+        shell: bash
+        run: |
+          expected=(stopproof-aarch64-apple-darwin stopproof-x86_64-apple-darwin stopproof-x86_64-pc-windows-msvc.exe stopproof-x86_64-unknown-linux-musl)
+          for asset in "${expected[@]}"; do test -s "$asset"; done
+          test "$(find . -maxdepth 1 -type f | wc -l)" -eq 4
+          sha256sum "${expected[@]}" > SHA256SUMS
+          sha256sum --check SHA256SUMS
+      - name: Publish binaries and checksums together
         uses: softprops/action-gh-release@v2
         with:
           files: dist/*
+          fail_on_unmatched_files: true
           generate_release_notes: true

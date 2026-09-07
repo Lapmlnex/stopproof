@@ -1,0 +1,5 @@
+{
+  "test_command": "npm test -- --run",
+  "test_timeout_secs": 120,
+  "require_tests": true
+}

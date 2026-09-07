@@ -82,7 +82,10 @@ pub fn detect(cwd: &Path, cfg: &Config) -> (Option<String>, String) {
         return (Some(cmd), "package.json".to_string());
     }
     if cwd.join("Cargo.toml").exists() {
-        return (Some("cargo test --quiet".to_string()), "Cargo.toml".to_string());
+        return (
+            Some("cargo test --quiet".to_string()),
+            "Cargo.toml".to_string(),
+        );
     }
     if cwd.join("go.mod").exists() {
         return (Some("go test ./...".to_string()), "go.mod".to_string());
@@ -119,6 +122,27 @@ fn tail_of(bytes_out: &[u8], bytes_err: &[u8], max_lines: usize, max_chars: usiz
     tail
 }
 
+/// Retain at most 64 KiB per stream but keep consuming every byte, so verbose
+/// test processes cannot grow our memory indefinitely or block on a full pipe.
+fn read_tail(mut reader: impl std::io::Read) -> Vec<u8> {
+    const RETAIN_BYTES: usize = 64 * 1024;
+    let mut retained = std::collections::VecDeque::with_capacity(RETAIN_BYTES);
+    let mut chunk = [0u8; 8192];
+    loop {
+        match reader.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(count) => {
+                let discard = (retained.len() + count).saturating_sub(RETAIN_BYTES);
+                retained.drain(..discard);
+                retained.extend(&chunk[..count]);
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+    retained.into()
+}
+
 fn run_with_timeout(cwd: &Path, command: &str, secs: u64) -> (Option<i32>, bool, String) {
     let mut cmd = if cfg!(windows) {
         let mut c = Command::new("cmd");
@@ -144,34 +168,27 @@ fn run_with_timeout(cwd: &Path, command: &str, secs: u64) -> (Option<i32>, bool,
     // command leaves grandchildren holding the pipes open (dev servers,
     // stubborn runners), killing the shell isn't enough and a join would
     // hang forever. recv_timeout below caps how long we wait for output.
-    let mut stdout_pipe = child.stdout.take();
-    let mut stderr_pipe = child.stderr.take();
+    let stdout_pipe = child.stdout.take();
+    let stderr_pipe = child.stderr.take();
     let (tx_out, rx_out) = std::sync::mpsc::channel::<Vec<u8>>();
     let (tx_err, rx_err) = std::sync::mpsc::channel::<Vec<u8>>();
     std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        if let Some(p) = stdout_pipe.as_mut() {
-            use std::io::Read;
-            p.read_to_end(&mut buf).ok();
-        }
+        let buf = stdout_pipe.map(read_tail).unwrap_or_default();
         tx_out.send(buf).ok();
     });
     std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        if let Some(p) = stderr_pipe.as_mut() {
-            use std::io::Read;
-            p.read_to_end(&mut buf).ok();
-        }
+        let buf = stderr_pipe.map(read_tail).unwrap_or_default();
         tx_err.send(buf).ok();
     });
 
-    let deadline = Instant::now() + Duration::from_secs(secs.max(1));
+    let started = Instant::now();
+    let timeout = Duration::from_secs(secs.max(1));
     let mut timed_out = false;
     let exit_code: Option<i32> = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status.code(),
             Ok(None) => {
-                if Instant::now() >= deadline {
+                if started.elapsed() >= timeout {
                     child.kill().ok();
                     child.wait().ok();
                     timed_out = true;
@@ -303,5 +320,17 @@ mod tests {
         let out = detect_and_run(&dir, &cfg);
         assert!(out.output_tail.contains("FAILURE_DETAIL"));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn retained_output_is_bounded_while_reader_drains_to_eof() {
+        let mut bytes = vec![b'x'; 2 * 1024 * 1024];
+        bytes.extend_from_slice(b"FINAL_OUTPUT");
+        let total = bytes.len();
+        let mut reader = std::io::Cursor::new(bytes);
+        let retained = read_tail(&mut reader);
+        assert_eq!(reader.position(), total as u64);
+        assert_eq!(retained.len(), 64 * 1024);
+        assert!(retained.ends_with(b"FINAL_OUTPUT"));
     }
 }

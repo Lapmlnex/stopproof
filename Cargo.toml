@@ -1,9 +1,9 @@
 [package]
 name = "stopproof"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.74"
-description = "Deterministic completion receipts for coding agents. Your agent says it's done — stopproof makes it prove it."
+description = "Test-command and Git evidence receipts for coding agents and CI."
 license = "MIT"
 repository = "https://github.com/Lapmlnex/stopproof"
 keywords = ["claude-code", "hooks", "agent", "verification", "ai"]

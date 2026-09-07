@@ -60,7 +60,12 @@ pub fn to_markdown(r: &Receipt) -> String {
     ));
     md.push_str("## Checks\n\n");
     for c in &r.checks {
-        md.push_str(&format!("- {} **{}** — {}\n", status_icon(&c.status), c.name, c.detail));
+        md.push_str(&format!(
+            "- {} **{}** — {}\n",
+            status_icon(&c.status),
+            c.name,
+            c.detail
+        ));
     }
     md.push_str("\n## Evidence\n\n");
     if !r.edited_files.is_empty() {
@@ -95,10 +100,10 @@ pub fn to_markdown(r: &Receipt) -> String {
 }
 
 /// Write JSON + Markdown receipts. Returns the JSON path on success.
-pub fn write(cwd: &Path, cfg: &Config, receipt: &Receipt) -> Option<PathBuf> {
+pub fn write(cwd: &Path, cfg: &Config, receipt: &Receipt) -> std::io::Result<PathBuf> {
     let dir = cwd.join(&cfg.receipt_dir);
     let receipts_dir = dir.join("receipts");
-    std::fs::create_dir_all(&receipts_dir).ok()?;
+    std::fs::create_dir_all(&receipts_dir)?;
 
     let stamp = crate::timefmt::compact_ts(crate::timefmt::now_epoch_secs());
     let json_path = receipts_dir.join(format!(
@@ -108,10 +113,27 @@ pub fn write(cwd: &Path, cfg: &Config, receipt: &Receipt) -> Option<PathBuf> {
         std::process::id(),
         receipt.verdict
     ));
-    let json = serde_json::to_string_pretty(receipt).ok()?;
-    std::fs::write(&json_path, json).ok()?;
-    std::fs::write(dir.join("last-receipt.md"), to_markdown(receipt)).ok()?;
-    Some(json_path)
+    let json = serde_json::to_string_pretty(receipt)
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
+    let json_temp = json_path.with_extension("json.tmp");
+    let md_temp = json_path.with_extension("md.tmp");
+    let mut json_saved = false;
+    let result = (|| {
+        std::fs::write(&json_temp, json)?;
+        std::fs::write(&md_temp, to_markdown(receipt))?;
+        std::fs::rename(&json_temp, &json_path)?;
+        json_saved = true;
+        std::fs::rename(&md_temp, dir.join("last-receipt.md"))?;
+        Ok(json_path.clone())
+    })();
+    if result.is_err() {
+        std::fs::remove_file(&json_temp).ok();
+        std::fs::remove_file(&md_temp).ok();
+        if json_saved {
+            std::fs::remove_file(&json_path).ok();
+        }
+    }
+    result
 }
 
 #[cfg(test)]
@@ -121,14 +143,18 @@ mod tests {
     fn sample() -> Receipt {
         Receipt {
             tool: "stopproof".into(),
-            version: "0.1.0".into(),
+            version: crate::VERSION.into(),
             verdict: "fail".into(),
             session_id: "abc".into(),
             generated_at: "2026-07-12T00:00:00Z".into(),
             attempt: 1,
             checks: vec![
                 Check::new("tests", "fail", "`cargo test` exited 101".into()),
-                Check::new("diff-reconciliation", "pass", "all claims backed by git".into()),
+                Check::new(
+                    "diff-reconciliation",
+                    "pass",
+                    "all claims backed by git".into(),
+                ),
             ],
             edited_files: vec!["src/a.rs".into()],
             claimed_paths: vec!["src/a.rs".into()],
@@ -150,13 +176,14 @@ mod tests {
 
     #[test]
     fn writes_both_files() {
-        let dir = std::env::temp_dir().join(format!(
-            "stopproof-receipt-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ))
-        .to_string_lossy()
-        .replace(['(', ')', ' '], "-");
+        let dir = std::env::temp_dir()
+            .join(format!(
+                "stopproof-receipt-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ))
+            .to_string_lossy()
+            .replace(['(', ')', ' '], "-");
         let dir = std::path::PathBuf::from(dir);
         std::fs::create_dir_all(&dir).unwrap();
         let cfg = Config::default();

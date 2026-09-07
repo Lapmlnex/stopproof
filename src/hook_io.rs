@@ -40,10 +40,22 @@ pub fn read_stdin_input() -> Option<HookInput> {
 fn state_file(cwd: &Path, receipt_dir: &str, session_id: &str) -> PathBuf {
     let safe: String = session_id
         .chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' { c } else { '_' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
-    let name = if safe.is_empty() { "unknown".to_string() } else { safe };
-    cwd.join(receipt_dir).join("state").join(format!("{}.attempts", name))
+    let name = if safe.is_empty() {
+        "unknown".to_string()
+    } else {
+        safe
+    };
+    cwd.join(receipt_dir)
+        .join("state")
+        .join(format!("{}.attempts", name))
 }
 
 /// Number of times we've already blocked this session's Stop.
@@ -109,10 +121,7 @@ mod tests {
 
     #[test]
     fn attempts_roundtrip() {
-        let dir = std::env::temp_dir().join(format!(
-            "stopproof-state-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("stopproof-state-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         assert_eq!(attempts_get(&dir, ".stopproof", "s1"), 0);
         attempts_set(&dir, ".stopproof", "s1", 2);
@@ -124,10 +133,7 @@ mod tests {
 
     #[test]
     fn weird_session_ids_are_sanitised() {
-        let dir = std::env::temp_dir().join(format!(
-            "stopproof-state2-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("stopproof-state2-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         attempts_set(&dir, ".stopproof", "../../evil", 1);
         assert_eq!(attempts_get(&dir, ".stopproof", "../../evil"), 1);

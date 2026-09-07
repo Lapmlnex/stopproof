@@ -124,7 +124,9 @@ pub fn analyze(transcript_path: &Path, cwd: &Path) -> TranscriptFacts {
         //          or {"role":"assistant","content":[...]}
         let (role, content) = if let Some(msg) = v.get("message") {
             (
-                msg.get("role").and_then(Value::as_str).unwrap_or(entry_type),
+                msg.get("role")
+                    .and_then(Value::as_str)
+                    .unwrap_or(entry_type),
                 msg.get("content"),
             )
         } else {
